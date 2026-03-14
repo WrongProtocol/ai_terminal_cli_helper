@@ -2,6 +2,10 @@
 
 Turn natural language into a best-effort Linux shell command.
 
+As a long-time linux user, I really didn't want to make a "cheat app" and lose my CLI dignity. However, I've given in, and it's amazing. 
+
+Configuration supports ollama, openai, or openclaw as the ai provider. It's a single-file app, easy to edit. 
+
 ## Install
 
 ```bash
@@ -20,6 +24,11 @@ ai search running processes for python
 ai --run find what is listening on port 8000
 
 ai --explain show disk usage by directory
+# COMMAND: df -h
+
+# Shows free/used space for all mounted filesystems in human-readable units.
+# Look at the “Avail” column for available space and “Use%” for utilization.
+# If you only care about a specific path, you can use: df -h /path/to/check
 ```
 
 ## Providers
