@@ -35,9 +35,9 @@ ai --explain show disk usage by directory
 
 Configured in `~/.config/ai/config.json`:
 
-- `openclaw` (recommended if your OpenClaw Gateway is configured with Claude Opus 4.6)
+- `openclaw` (recommended if your OpenClaw Gateway is already configured)
 - `openai` (requires `OPENAI_API_KEY` or configured env var)
-- `ollama` (defaults to `http://localhost:11434`)
+- `ollama` (requires you to already have ollama set up; defaults to `http://localhost:11434`)
 
 Override per call:
 
