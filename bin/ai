@@ -3,14 +3,15 @@
 
 Usage:
   ai <natural language request>
-  ai --run <natural language request>     # executes the suggested command
+  ai --run <natural language request>     # show + confirm + execute
+  ai --run -y <natural language request>  # execute without confirmation
   ai --explain <request>                  # get explanation + command
 
 Config:
   ~/.config/ai/config.json
 
 Providers:
-  - openclaw: uses `openclaw agent` locally (recommended if your Gateway is configured with Claude Opus 4.6)
+  - openclaw: uses `openclaw agent` locally (recommended if your Gateway is running)
   - openai:   uses OpenAI Chat Completions API (requires OPENAI_API_KEY or configured env)
   - ollama:   uses local Ollama server (default http://localhost:11434)
 """
@@ -18,50 +19,61 @@ Providers:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
-import shlex
+import re
+import shutil
 import subprocess
 import sys
 import textwrap
+import urllib.error
 import urllib.request
+
+__version__ = "0.2.0"
 
 DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/ai/config.json")
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: dict = {
     "provider": "openclaw",
     "openclaw": {
         "session_id": "ai-cli",
         "agent": None,
-        "thinking": "low"
+        "thinking": "low",
     },
     "openai": {
         "api_key_env": "OPENAI_API_KEY",
         "base_url": "https://api.openai.com/v1",
-        "model": "gpt-5.2"
+        "model": "gpt-5.2",
     },
     "ollama": {
         "base_url": "http://localhost:11434",
-        "model": "qwen3:14b"
+        "model": "qwen3:14b",
     },
     "behavior": {
         "shell": "bash",
         "max_tokens": 256,
-        "temperature": 0.1
-    }
+        "temperature": 0.1,
+        "confirm_before_run": True,
+        "timeout": 60,
+    },
 }
 
-SYSTEM_PROMPT_COMMAND_ONLY = textwrap.dedent(
-    """\
+SYSTEM_PROMPT_COMMAND_ONLY = textwrap.dedent("""\
     You translate natural language requests into a single best-effort Linux shell command.
 
     Output rules (critical):
-    - Output ONLY the command (no markdown, no code fences, no commentary).
+    - Output ONLY the raw command. No markdown, no code fences, no backtick wrapping, no commentary.
+    - Do NOT prefix with "```", "bash", "sh", "$", or "#".
+    - The output must be directly copy-pasteable into a terminal.
     - Prefer common GNU/Linux tools and safe read-only commands.
+    - Use single quotes for strings containing spaces or special characters when possible.
     - If the request is ambiguous, choose the safest reasonable interpretation.
-    - Avoid destructive commands (rm, dd, mkfs, :(){:|:&};:, chmod -R, chown -R, etc.).
-      If destruction is truly required, output: UNKNOWN
-    - If you cannot produce a good command, output: UNKNOWN
+    - Avoid destructive commands (rm, dd, mkfs, :(){:|:&};:, chmod -R 777, chown -R, etc.)
+      unless the user explicitly requests deletion/destruction.
+      If destruction is truly required, output exactly: UNKNOWN
+    - If you genuinely cannot produce a useful command, output exactly: UNKNOWN
+    - Do NOT output any thinking, reasoning, or chain-of-thought. Command only.
 
     Examples:
     User: search running processes for python
@@ -69,31 +81,71 @@ SYSTEM_PROMPT_COMMAND_ONLY = textwrap.dedent(
 
     User: find what is listening on port 8000
     Output: ss -ltnp | grep ':8000'
-    """
-).strip()
 
-SYSTEM_PROMPT_EXPLAIN = textwrap.dedent(
-    """\
+    User: show files bigger than 100MB in current directory
+    Output: find . -type f -size +100M -exec ls -lh {} +
+
+    User: what's my public IP
+    Output: curl -s ifconfig.me
+""").strip()
+
+SYSTEM_PROMPT_EXPLAIN = textwrap.dedent("""\
     You help with Linux terminal commands.
 
     Output rules (critical):
-    - First line: COMMAND: <one line shell command>
-    - Then a short explanation (2-6 lines).
+    - First line must be exactly: COMMAND: <one-line shell command>
+    - Then a blank line, followed by a short explanation (2-6 lines).
+    - Do NOT wrap the command in backticks or code fences.
     - Prefer common GNU/Linux tools and safe read-only commands.
     - Avoid destructive commands; if required, say so and propose safe alternatives.
-    """
-).strip()
+    - Do NOT output any thinking or chain-of-thought. Just the command and explanation.
+""").strip()
 
+# ---------------------------------------------------------------------------
+# Terminal colors (disabled when piped / no tty)
+# ---------------------------------------------------------------------------
+_COLOR = sys.stderr.isatty()
+
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _COLOR else text
+
+def _dim(t: str) -> str:   return _c("2", t)
+def _bold(t: str) -> str:  return _c("1", t)
+def _green(t: str) -> str: return _c("32", t)
+def _cyan(t: str) -> str:  return _c("36", t)
+def _red(t: str) -> str:   return _c("31", t)
+def _yellow(t: str) -> str: return _c("33", t)
 
 def eprint(*args: object) -> None:
     print(*args, file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge *override* into a copy of *base*."""
+    result = copy.deepcopy(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = copy.deepcopy(v)
+    return result
+
+
 def load_config(path: str) -> dict:
+    """Load user config and merge with defaults so missing keys are safe."""
     if not os.path.exists(path):
-        return json.loads(json.dumps(DEFAULT_CONFIG))
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return copy.deepcopy(DEFAULT_CONFIG)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            user = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        eprint(f"{_yellow('warn:')} bad config at {path}: {exc}; using defaults")
+        return copy.deepcopy(DEFAULT_CONFIG)
+    return _deep_merge(DEFAULT_CONFIG, user)
 
 
 def ensure_config_exists(path: str) -> None:
@@ -105,51 +157,182 @@ def ensure_config_exists(path: str) -> None:
         f.write("\n")
 
 
-def call_openclaw(cfg: dict, user_text: str, explain: bool) -> str:
-    oc = cfg.get("openclaw", {})
-    session_id = oc.get("session_id") or "ai-cli"
-    agent = oc.get("agent")
-    thinking = oc.get("thinking") or "low"
-
-    system = SYSTEM_PROMPT_EXPLAIN if explain else SYSTEM_PROMPT_COMMAND_ONLY
-    msg = f"{system}\n\nUser: {user_text}\n"
-
-    cmd = ["openclaw", "agent", "--session-id", str(session_id), "--message", msg, "--thinking", str(thinking), "--json"]
-    if agent:
-        cmd.extend(["--agent", str(agent)])
-
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(p.stderr.strip() or f"openclaw agent failed ({p.returncode})")
-
-    data = json.loads(p.stdout)
-    payloads = (((data or {}).get("result") or {}).get("payloads") or [])
-    text = (payloads[0].get("text") if payloads else "") or ""
-    return text.strip()
+def _cfg_int(cfg: dict, *keys: str, default: int = 0) -> int:
+    v = cfg
+    for k in keys:
+        v = (v or {}).get(k)  # type: ignore[union-attr]
+    try:
+        return int(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
 
 
-def http_json(url: str, payload: dict, headers: dict | None = None) -> dict:
+def _cfg_float(cfg: dict, *keys: str, default: float = 0.0) -> float:
+    v = cfg
+    for k in keys:
+        v = (v or {}).get(k)  # type: ignore[union-attr]
+    try:
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------------------
+# HTTP helper
+# ---------------------------------------------------------------------------
+
+def http_json(url: str, payload: dict, headers: dict | None = None,
+              timeout: int = 60) -> dict:
+    """POST JSON and return parsed response. Raises RuntimeError on failure."""
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
     if headers:
         for k, v in headers.items():
             req.add_header(k, v)
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        raw = resp.read().decode("utf-8")
-        return json.loads(raw)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"HTTP {exc.code} from {url}"
+            + (f": {detail}" if detail else "")
+        ) from None
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Connection failed ({url}): {exc.reason}") from None
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON response from {url}: {exc}") from None
+    except TimeoutError:
+        raise RuntimeError(f"Request timed out ({url})") from None
+
+
+# ---------------------------------------------------------------------------
+# Text cleanup
+# ---------------------------------------------------------------------------
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_FENCE_RE = re.compile(
+    r"^```(?:bash|sh|shell|zsh|fish)?\s*\n(.*?)\n?```\s*$",
+    re.DOTALL | re.MULTILINE,
+)
+_INLINE_CODE_RE = re.compile(r"^`([^`]+)`$")
+
+
+def _strip_model_artifacts(text: str) -> str:
+    """Remove thinking tags, code fences, and inline backtick wrapping."""
+    # Strip <think>…</think> blocks (e.g. qwen3, deepseek)
+    text = _THINK_RE.sub("", text).strip()
+
+    # Strip code fences
+    m = _FENCE_RE.search(text)
+    if m:
+        text = m.group(1).strip()
+
+    # Strip single inline backtick wrapping: `command` → command
+    m = _INLINE_CODE_RE.match(text.strip())
+    if m:
+        text = m.group(1).strip()
+
+    # Strip leading $ or # prompt markers
+    if text.startswith("$ ") or text.startswith("# "):
+        text = text[2:]
+
+    return text.strip()
+
+
+def normalize_command_output(text: str) -> str:
+    """Clean up a command-only response from a model."""
+    return _strip_model_artifacts(text or "")
+
+
+def extract_command_from_explain(text: str) -> str | None:
+    """Pull the command from a COMMAND: <cmd> line in explain-mode output."""
+    text = _strip_model_artifacts(text or "")
+    for line in text.splitlines():
+        line = line.strip()
+        if line.upper().startswith("COMMAND:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Provider calls
+# ---------------------------------------------------------------------------
+
+def call_openclaw(cfg: dict, user_text: str, explain: bool) -> str:
+    oc = cfg.get("openclaw", {})
+    session_id = oc.get("session_id") or "ai-cli"
+    agent = oc.get("agent")
+    thinking = oc.get("thinking") or "low"
+    system = SYSTEM_PROMPT_EXPLAIN if explain else SYSTEM_PROMPT_COMMAND_ONLY
+
+    # Build message with clear delimiters so quotes in user_text don't
+    # bleed into the system prompt.
+    msg = (
+        f"=== SYSTEM INSTRUCTIONS ===\n{system}\n"
+        f"=== END INSTRUCTIONS ===\n\n"
+        f"User request: {user_text}\n"
+    )
+
+    cmd: list[str] = [
+        "openclaw", "agent",
+        "--session-id", str(session_id),
+        "--message", msg,
+        "--thinking", str(thinking),
+        "--json",
+    ]
+    if agent:
+        cmd.extend(["--agent", str(agent)])
+
+    # Check that openclaw CLI exists
+    if not shutil.which("openclaw"):
+        raise RuntimeError(
+            "openclaw CLI not found on PATH. "
+            "Install it or switch provider to 'openai' or 'ollama'."
+        )
+
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("openclaw agent timed out (120s)")
+    except FileNotFoundError:
+        raise RuntimeError("openclaw CLI not found on PATH")
+
+    if p.returncode != 0:
+        stderr = p.stderr.strip()
+        raise RuntimeError(stderr or f"openclaw agent failed (exit {p.returncode})")
+
+    try:
+        data = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        # Sometimes openclaw outputs text directly
+        return p.stdout.strip()
+
+    payloads = (((data or {}).get("result") or {}).get("payloads") or [])
+    text = (payloads[0].get("text") if payloads else "") or ""
+    return text.strip()
 
 
 def call_openai(cfg: dict, user_text: str, explain: bool) -> str:
     oa = cfg.get("openai", {})
-    base_url = oa.get("base_url") or "https://api.openai.com/v1"
+    base_url = (oa.get("base_url") or "https://api.openai.com/v1").rstrip("/")
     model = oa.get("model") or "gpt-5.2"
     api_key_env = oa.get("api_key_env") or "OPENAI_API_KEY"
     api_key = os.environ.get(api_key_env)
     if not api_key:
-        raise RuntimeError(f"Missing OpenAI API key in env var {api_key_env}")
+        raise RuntimeError(
+            f"Missing API key: set ${api_key_env} or change "
+            f"openai.api_key_env in config"
+        )
 
     system = SYSTEM_PROMPT_EXPLAIN if explain else SYSTEM_PROMPT_COMMAND_ONLY
+    timeout = _cfg_int(cfg, "behavior", "timeout", default=60)
 
     payload = {
         "model": model,
@@ -157,28 +340,32 @@ def call_openai(cfg: dict, user_text: str, explain: bool) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": user_text},
         ],
-        "temperature": float((cfg.get("behavior", {}) or {}).get("temperature", 0.1)),
-        "max_tokens": int((cfg.get("behavior", {}) or {}).get("max_tokens", 256)),
+        "temperature": _cfg_float(cfg, "behavior", "temperature", default=0.1),
+        "max_tokens": _cfg_int(cfg, "behavior", "max_tokens", default=256),
     }
 
     data = http_json(
-        f"{base_url.rstrip('/')}/chat/completions",
+        f"{base_url}/chat/completions",
         payload,
         headers={"Authorization": f"Bearer {api_key}"},
+        timeout=timeout,
     )
 
     try:
         return (data["choices"][0]["message"]["content"] or "").strip()
-    except Exception:
-        raise RuntimeError(f"Unexpected OpenAI response: {json.dumps(data)[:4000]}")
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(
+            f"Unexpected OpenAI response structure: {exc}\n"
+            f"{json.dumps(data)[:2000]}"
+        ) from None
 
 
 def call_ollama(cfg: dict, user_text: str, explain: bool) -> str:
     ol = cfg.get("ollama", {})
-    base_url = ol.get("base_url") or "http://localhost:11434"
+    base_url = (ol.get("base_url") or "http://localhost:11434").rstrip("/")
     model = ol.get("model") or "qwen3:14b"
-
     system = SYSTEM_PROMPT_EXPLAIN if explain else SYSTEM_PROMPT_COMMAND_ONLY
+    timeout = _cfg_int(cfg, "behavior", "timeout", default=60)
 
     payload = {
         "model": model,
@@ -188,83 +375,153 @@ def call_ollama(cfg: dict, user_text: str, explain: bool) -> str:
             {"role": "user", "content": user_text},
         ],
         "options": {
-            "temperature": float((cfg.get("behavior", {}) or {}).get("temperature", 0.1)),
-            "num_predict": int((cfg.get("behavior", {}) or {}).get("max_tokens", 256)),
+            "temperature": _cfg_float(cfg, "behavior", "temperature", default=0.1),
+            "num_predict": _cfg_int(cfg, "behavior", "max_tokens", default=256),
         },
     }
 
-    data = http_json(f"{base_url.rstrip('/')}/api/chat", payload)
-    msg = (data.get("message") or {}).get("content") or ""
+    data = http_json(f"{base_url}/api/chat", payload, timeout=timeout)
+
+    try:
+        msg = (data.get("message") or {}).get("content") or ""
+    except AttributeError:
+        raise RuntimeError(
+            f"Unexpected Ollama response: {json.dumps(data)[:2000]}"
+        ) from None
     return msg.strip()
 
 
-def normalize_command_output(text: str) -> str:
-    t = (text or "").strip()
-    # strip accidental code fences if the model disobeys
-    if t.startswith("```"):
-        t = t.strip("`")
-        t = t.replace("bash\n", "").replace("sh\n", "")
-        t = t.strip()
-    return t.strip()
+# ---------------------------------------------------------------------------
+# Confirmation
+# ---------------------------------------------------------------------------
+
+def confirm_run(cmd: str) -> bool:
+    """Ask the user to confirm before executing. Returns True to proceed."""
+    eprint(f"\n  {_bold(_cyan(cmd))}\n")
+    try:
+        answer = input(f"{_yellow('Execute?')} [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        eprint("")
+        return False
+    return answer in ("y", "yes")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ai",
+        description="Translate natural language into Linux shell commands.",
+        epilog="Examples:\n"
+               "  ai search running processes for python\n"
+               "  ai --run find what is listening on port 8000\n"
+               "  ai --explain show disk usage by directory\n"
+               "  ai --provider ollama list files bigger than 1GB\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Config file path")
+    parser.add_argument(
+        "--provider", choices=["openclaw", "openai", "ollama"],
+        help="Override provider for this call",
+    )
+    parser.add_argument(
+        "--run", action="store_true",
+        help="Show the command, confirm, then execute it",
+    )
+    parser.add_argument(
+        "-y", "--yes", action="store_true",
+        help="Skip confirmation when using --run",
+    )
+    parser.add_argument(
+        "--explain", action="store_true",
+        help="Return an explanation alongside the command",
+    )
+    parser.add_argument("--init", action="store_true", help="Create default config and exit")
+    # Use parse_known_args below to avoid '--foo' in queries being eaten as flags
+    return parser
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="ai", add_help=True)
-    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--provider", choices=["openclaw", "openai", "ollama"], help="Override provider")
-    parser.add_argument("--run", action="store_true", help="Execute the suggested command")
-    parser.add_argument("--explain", action="store_true", help="Return explanation + command")
-    parser.add_argument("--init", action="store_true", help="Create default config and exit")
-    parser.add_argument("query", nargs=argparse.REMAINDER, help="Your request")
-
-    args = parser.parse_args()
+    parser = build_parser()
+    args, remaining = parser.parse_known_args()
 
     if args.init:
         ensure_config_exists(args.config)
-        print(args.config)
+        eprint(f"Config: {args.config}")
         return 0
 
-    if not args.query:
-        eprint("Usage: ai <request>\nTry: ai --init")
+    # Combine any remaining tokens as the query.
+    # This handles cases like: ai what's my IP   (apostrophe)
+    #                          ai --run list files  (--run is consumed, rest is query)
+    query = " ".join(remaining).strip()
+    if not query:
+        parser.print_help(sys.stderr)
         return 2
 
     cfg = load_config(args.config)
     provider = args.provider or cfg.get("provider") or "openclaw"
+    timeout_sec = _cfg_int(cfg, "behavior", "timeout", default=60)
 
-    user_text = " ".join(args.query).strip()
-    if not user_text:
-        eprint("Empty request")
-        return 2
+    eprint(_dim(f"[{provider}] thinking..."))
 
     try:
         if provider == "openclaw":
-            out = call_openclaw(cfg, user_text, args.explain)
+            out = call_openclaw(cfg, query, args.explain)
         elif provider == "openai":
-            out = call_openai(cfg, user_text, args.explain)
+            out = call_openai(cfg, query, args.explain)
         elif provider == "ollama":
-            out = call_ollama(cfg, user_text, args.explain)
+            out = call_ollama(cfg, query, args.explain)
         else:
             raise RuntimeError(f"Unknown provider: {provider}")
-    except Exception as e:
-        eprint(f"ai: {e}")
+    except KeyboardInterrupt:
+        eprint("\nCancelled.")
+        return 130
+    except RuntimeError as exc:
+        eprint(f"{_red('error:')} {exc}")
+        return 1
+    except Exception as exc:
+        eprint(f"{_red('error:')} unexpected: {type(exc).__name__}: {exc}")
         return 1
 
-    out = normalize_command_output(out)
-
+    # --- Explain mode ---
     if args.explain:
-        # If model didn't follow format, just print what we got.
-        print(out)
+        cleaned = _strip_model_artifacts(out)
+        print(cleaned)
+        # If --run --explain, extract and offer to run the command
+        if args.run:
+            cmd = extract_command_from_explain(out)
+            if cmd and cmd.upper() != "UNKNOWN":
+                skip_confirm = args.yes or not cfg.get("behavior", {}).get("confirm_before_run", True)
+                if skip_confirm or confirm_run(cmd):
+                    shell = cfg.get("behavior", {}).get("shell") or "bash"
+                    return subprocess.call([shell, "-c", cmd])
         return 0
 
-    cmd = out.splitlines()[0].strip() if out else ""
-    if cmd.upper() == "UNKNOWN" or cmd == "":
-        eprint("UNKNOWN")
+    # --- Command-only mode ---
+    cmd = normalize_command_output(out)
+
+    # Take only the first line (models sometimes add commentary after)
+    cmd = cmd.splitlines()[0].strip() if cmd else ""
+
+    if cmd.upper() == "UNKNOWN" or not cmd:
+        eprint(_yellow("Could not produce a command for that request."))
         return 3
 
     if args.run:
-        # Run via user's shell for pipes/redirects.
-        shell = ((cfg.get("behavior", {}) or {}).get("shell") or "bash")
-        subprocess.run([shell, "-lc", cmd])
+        skip_confirm = args.yes or not cfg.get("behavior", {}).get("confirm_before_run", True)
+        if skip_confirm or confirm_run(cmd):
+            shell = cfg.get("behavior", {}).get("shell") or "bash"
+            return subprocess.call([shell, "-c", cmd])
+        else:
+            eprint("Aborted.")
+            # Still print the command to stdout so it's usable
+            print(cmd)
+            return 0
     else:
         print(cmd)
 
